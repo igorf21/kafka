@@ -35,6 +35,8 @@ import org.apache.kafka.streams.processor.TopicNameExtractor;
 import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.StoreBuilder;
 
+import java.util.function.Function;
+
 /**
  * {@code KStream} is an abstraction of a <i>record stream</i> of {@link KeyValue} pairs, i.e., each record is an
  * independent entity/event in the real world.
@@ -5173,4 +5175,8 @@ public interface KStream<K, V> {
         final Named named,
         final String... stateStoreNames
     );
+
+    <VR, KO, VO> KStream<K, VR> leftJoin(final KTable<KO, VO> other,
+                                         final Function<VO, KO> foreignKeyExtractor,
+                                         final ValueJoiner<V, VO, VR> joiner);
 }
