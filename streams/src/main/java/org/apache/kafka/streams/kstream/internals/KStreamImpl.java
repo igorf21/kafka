@@ -17,46 +17,15 @@
 package org.apache.kafka.streams.kstream.internals;
 
 import org.apache.kafka.common.serialization.Serde;
+import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.utils.Bytes;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.internals.ApiUtils;
-import org.apache.kafka.streams.kstream.BranchedKStream;
-import org.apache.kafka.streams.kstream.ForeachAction;
-import org.apache.kafka.streams.kstream.ForeachProcessor;
-import org.apache.kafka.streams.kstream.GlobalKTable;
-import org.apache.kafka.streams.kstream.Grouped;
-import org.apache.kafka.streams.kstream.JoinWindows;
-import org.apache.kafka.streams.kstream.Joined;
-import org.apache.kafka.streams.kstream.KGroupedStream;
-import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.KTable;
-import org.apache.kafka.streams.kstream.KeyValueMapper;
-import org.apache.kafka.streams.kstream.Materialized;
-import org.apache.kafka.streams.kstream.Named;
-import org.apache.kafka.streams.kstream.Predicate;
-import org.apache.kafka.streams.kstream.Printed;
-import org.apache.kafka.streams.kstream.Produced;
-import org.apache.kafka.streams.kstream.Repartitioned;
-import org.apache.kafka.streams.kstream.StreamJoined;
-import org.apache.kafka.streams.kstream.TransformerSupplier;
-import org.apache.kafka.streams.kstream.ValueJoiner;
-import org.apache.kafka.streams.kstream.ValueJoinerWithKey;
-import org.apache.kafka.streams.kstream.ValueMapper;
-import org.apache.kafka.streams.kstream.ValueMapperWithKey;
-import org.apache.kafka.streams.kstream.ValueTransformerSupplier;
-import org.apache.kafka.streams.kstream.ValueTransformerWithKeySupplier;
-import org.apache.kafka.streams.kstream.internals.graph.BaseRepartitionNode;
+import org.apache.kafka.streams.kstream.*;
+import org.apache.kafka.streams.kstream.internals.foreignkeyjoin.*;
+import org.apache.kafka.streams.kstream.internals.graph.*;
 import org.apache.kafka.streams.kstream.internals.graph.BaseRepartitionNode.BaseRepartitionNodeBuilder;
-import org.apache.kafka.streams.kstream.internals.graph.GraphNode;
-import org.apache.kafka.streams.kstream.internals.graph.OptimizableRepartitionNode;
 import org.apache.kafka.streams.kstream.internals.graph.OptimizableRepartitionNode.OptimizableRepartitionNodeBuilder;
-import org.apache.kafka.streams.kstream.internals.graph.ProcessorGraphNode;
-import org.apache.kafka.streams.kstream.internals.graph.ProcessorParameters;
-import org.apache.kafka.streams.kstream.internals.graph.StatefulProcessorNode;
-import org.apache.kafka.streams.kstream.internals.graph.StreamSinkNode;
-import org.apache.kafka.streams.kstream.internals.graph.StreamTableJoinNode;
-import org.apache.kafka.streams.kstream.internals.graph.StreamToTableNode;
-import org.apache.kafka.streams.kstream.internals.graph.UnoptimizableRepartitionNode;
 import org.apache.kafka.streams.kstream.internals.graph.UnoptimizableRepartitionNode.UnoptimizableRepartitionNodeBuilder;
 import org.apache.kafka.streams.processor.FailOnInvalidTimestamp;
 import org.apache.kafka.streams.processor.StreamPartitioner;
@@ -65,7 +34,7 @@ import org.apache.kafka.streams.processor.api.FixedKeyProcessorSupplier;
 import org.apache.kafka.streams.processor.api.ProcessorSupplier;
 import org.apache.kafka.streams.processor.internals.InternalTopicProperties;
 import org.apache.kafka.streams.processor.internals.StaticTopicNameExtractor;
-import org.apache.kafka.streams.state.KeyValueStore;
+import org.apache.kafka.streams.state.*;
 
 import java.lang.reflect.Array;
 import java.util.Arrays;
@@ -74,7 +43,9 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import org.apache.kafka.streams.state.VersionedBytesStoreSupplier;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
 import org.apache.kafka.streams.state.internals.RocksDBTimeOrderedKeyValueBuffer;
 import org.apache.kafka.streams.state.internals.RocksDBTimeOrderedKeyValueBytesStore;
 import org.apache.kafka.streams.state.internals.RocksDBTimeOrderedKeyValueBytesStoreSupplier;
@@ -141,6 +112,9 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
     private static final String TO_KTABLE_NAME = "KSTREAM-TOTABLE-";
 
     private static final String REPARTITION_NAME = "KSTREAM-REPARTITION-";
+    private static final String FK_JOIN_TABLE = "KTABLE-FK-JOIN-";
+    private static final String SUBSCRIPTION_REGISTRATION = FK_JOIN_TABLE + "SUBSCRIPTION-REGISTRATION-";
+    private static final String TOPIC_SUFFIX = "-topic";
 
     private final boolean repartitionRequired;
 
@@ -1618,5 +1592,192 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
             repartitionRequired,
             processNode,
             builder);
+    }
+    @Override
+    public <VR, KO, VO> KStream<K, VR> leftJoin(KTable<KO, VO> rightTable, Function<VO, KO> foreignKeyExtractor,
+                                                ValueJoiner<V, VO, VR> joiner) {
+        return doJoinOnForeignKey(
+                rightTable,
+                foreignKeyExtractor,
+                joiner,
+                TableJoined.with(null, null),
+                Materialized.with(null, null),
+                false
+        );
+    }
+
+    private final Function<Optional<Set<Integer>>, Integer> getPartition = maybeMulticastPartitions -> {
+        if (!maybeMulticastPartitions.isPresent()) {
+            return null;
+        }
+        if (maybeMulticastPartitions.get().size() != 1) {
+            throw new IllegalArgumentException("The partitions returned by StreamPartitioner#partitions method when used for FK join should be a singleton set");
+        }
+        return maybeMulticastPartitions.get().iterator().next();
+    };
+
+    @SuppressWarnings({"unchecked", "deprecation"})
+    private <VR, KO, VO> KStream<K, VR> doJoinOnForeignKey(final KTable<KO, VO> rightTable,
+                                                           final Function<VO, KO> foreignKeyExtractor,
+                                                           final ValueJoiner<V, VO, VR> joiner,
+                                                           final TableJoined<K, KO> tableJoined,
+                                                           final Materialized<K, VR, KeyValueStore<Bytes, byte[]>> materialized,
+                                                           final boolean leftJoin) {
+
+        Objects.requireNonNull(rightTable, "rightTable can't be null");
+        Objects.requireNonNull(foreignKeyExtractor, "foreignKeyExtractor can't be null");
+        Objects.requireNonNull(joiner, "joiner can't be null");
+        Objects.requireNonNull(tableJoined, "tableJoined can't be null");
+        Objects.requireNonNull(materialized, "materialized can't be null");
+
+        //Old values are a useful optimization. The old values from the rightTable table are compared to the new values,
+        //such that identical values do not cause a prefixScan. PrefixScan and propagation can be expensive and should
+        //not be done needlessly.
+        ((KTableImpl<?, ?, ?>) rightTable).enableSendingOldValues(true);
+
+        //Old values must be sent such that the ForeignJoinSubscriptionSendProcessorSupplier can propagate deletions to the correct node.
+        //This occurs whenever the extracted foreignKey changes values.
+
+
+        final TableJoinedInternal<K, KO> tableJoinedInternal = new TableJoinedInternal<>(tableJoined);
+
+        final NamedInternal renamed = new NamedInternal(tableJoinedInternal.name());
+
+        final String subscriptionTopicName = renamed.suffixWithOrElseGet(
+                "-subscription-registration",
+                ((KTableImpl<KO, VO, ?>) rightTable).builder,
+                SUBSCRIPTION_REGISTRATION
+        ) + TOPIC_SUFFIX;
+
+        // the decoration can't be performed until we have the configuration available when the app runs,
+        // so we pass Suppliers into the components, which they can call at run time
+
+        final Supplier<String> subscriptionPrimaryKeySerdePseudoTopic =
+                () -> internalTopologyBuilder().decoratePseudoTopic(subscriptionTopicName + "-pk");
+
+        final Supplier<String> subscriptionForeignKeySerdePseudoTopic =
+                () -> internalTopologyBuilder().decoratePseudoTopic(subscriptionTopicName + "-fk");
+
+        final Supplier<String> valueHashSerdePseudoTopic =
+                () -> internalTopologyBuilder().decoratePseudoTopic(subscriptionTopicName + "-vh");
+
+        final Supplier<String> subscriptionMessageValueSerdePseudoTopic =
+                () -> internalTopologyBuilder().decoratePseudoTopic(subscriptionTopicName + "-mv");
+
+        builder.internalTopologyBuilder.
+                addInternalTopic(subscriptionTopicName, InternalTopicProperties.empty());
+
+        final Serde<KO> rightTableKeySerde = ((KTableImpl<KO, VO, VO>) rightTable).keySerde;
+        final Serde<VO> rightTableValueSerde = ((KTableImpl<KO, VO, VO>) rightTable).valueSerde;
+
+        final Serde<NewSubscriptionWrapper<KO, VO>> newSubscriptionWrapperSerde =
+                new NewSubscriptionWrapperSerde<>(subscriptionPrimaryKeySerdePseudoTopic, rightTableKeySerde,
+                        subscriptionMessageValueSerdePseudoTopic,rightTableValueSerde);
+        final SubscriptionResponseWrapperSerde<VO> responseWrapperSerde =
+                new SubscriptionResponseWrapperSerde<>(((KTableImpl<KO, VO, VO>) rightTable).valueSerde);
+
+        //*********************  Co-partition right table changes with foreign key **************************
+        final ProcessorGraphNode<K, Change<VO>> subscriptionNode = new ProcessorGraphNode<>(
+                new ProcessorParameters<>(
+                        new NewForeignJoinSubscriptionSendProcessorSupplier<>
+                                (
+                                        foreignKeyExtractor,
+                                        subscriptionForeignKeySerdePseudoTopic,
+                                        valueHashSerdePseudoTopic,
+                                        rightTableKeySerde,
+                                        rightTableValueSerde.serializer(),
+                                        leftJoin
+                                ),
+                        "REKEY-MSG-BY-FOREIGN-KEY-PROCESSOR"
+                )
+        );
+
+        builder.addGraphNode(((KTableImpl<KO, VO, ?>) rightTable).graphNode, subscriptionNode);
+
+        //******************** Sink re-partitioned table stream to the intermediate topic *******************
+
+        final StreamPartitioner<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSinkPartitioner =
+                tableJoinedInternal.otherPartitioner() == null
+                        ? null
+                        : (topic, key, val, numPartitions) -> getPartition.apply(tableJoinedInternal.otherPartitioner().
+                        partitions(topic, key, null, numPartitions));
+
+        final StreamSinkNode<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSink = new StreamSinkNode<>(
+                renamed.suffixWithOrElseGet("-subscription-registration-sink", ((KTableImpl<KO, VO, ?>) rightTable).builder, "KTABLE-SINK-"),
+                new StaticTopicNameExtractor<>(subscriptionTopicName),
+                new ProducedInternal<>(Produced.with(rightTableKeySerde,
+                        newSubscriptionWrapperSerde,
+                        subscriptionSinkPartitioner))
+        );
+        builder.addGraphNode(subscriptionNode, subscriptionSink);
+
+        //********************* Subscribe to child table topic re-partitioned by foreign key ****************
+        final StreamSourceNode<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSource = new StreamSourceNode<>(
+                renamed.suffixWithOrElseGet("-subscription-registration-source",
+                        ((KTableImpl<KO, VO, ?>) rightTable).builder, "KTABLE-SOURCE-"),
+                Collections.singleton(subscriptionTopicName),
+                new ConsumedInternal<>(Consumed.with(rightTableKeySerde, newSubscriptionWrapperSerde))
+        );
+        builder.addGraphNode(graphNode, subscriptionSource);
+
+        //************************* Create Composite Key Store and Store table records in the store **********
+        final StoreBuilder<TimestampedKeyValueStore<Bytes, NewSubscriptionWrapper<KO, VO>>> subscriptionStore =
+                Stores.timestampedKeyValueStoreBuilder(
+                        Stores.persistentTimestampedKeyValueStore(
+                                "COMPOSITE-KEY-STORE"
+                        ),
+                        new Serdes.BytesSerde(),
+                        newSubscriptionWrapperSerde
+                );
+        builder.addStateStore(subscriptionStore); // add COMPOSITE-KEY-STORE
+
+        NewCombinedKeySchema <K, KO> combinedKeySchema = new NewCombinedKeySchema<>(
+                subscriptionPrimaryKeySerdePseudoTopic,
+                keySerde,
+                subscriptionForeignKeySerdePseudoTopic,
+                rightTableKeySerde
+        );
+
+        final StatefulProcessorNode<K, NewSubscriptionWrapper<KO, VO>> subscriptionReceiveNode =
+                new StatefulProcessorNode<>(
+                        new ProcessorParameters<>
+                                (
+                                        new NewSubscriptionStoreReceiveProcessorSupplier<>(
+                                                subscriptionStore,
+                                                combinedKeySchema
+                                        ),
+                                        "PURCHASE-TO-COMPOSITE-KEY-STORE"
+                                ),
+                        Collections.singleton(subscriptionStore),
+                        Collections.emptySet()
+                );
+        builder.addGraphNode(subscriptionSource, subscriptionReceiveNode);
+        //***************************************************************************************************
+
+        //*********************** Process stream records using lookups in composite key store *************
+        final StatefulProcessorNode<K, V> resolverNode =
+                new StatefulProcessorNode<>(
+                        new ProcessorParameters<>(
+                                new NewCompositeKeyProcessorSupplier(
+                                        subscriptionStore,
+                                        combinedKeySchema,
+                                        joiner
+                                ),
+                                "CONVERT-ALBUM-TO-PURCHASE"
+                        ),
+                        Collections.singleton(subscriptionStore),
+                        Collections.emptySet()
+                );
+        builder.addGraphNode(graphNode, resolverNode);
+
+        return new KStreamImpl<>(
+                name,
+                keySerde,
+                null,
+                subTopologySourceNodes,
+                false,
+                resolverNode,
+                builder);
+
     }
 }
