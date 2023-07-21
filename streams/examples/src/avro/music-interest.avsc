@@ -1,0 +1,10 @@
+{
+  "namespace": "org.apache.kafka.streams.examples.avro",
+  "type": "record",
+  "name": "MusicInterest",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "genre", "type": "string"},
+    {"name": "artist", "type": "string"}
+  ]
+}

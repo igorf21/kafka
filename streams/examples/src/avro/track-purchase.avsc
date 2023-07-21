@@ -1,0 +1,11 @@
+{
+  "namespace": "org.apache.kafka.streams.examples.avro",
+  "type": "record",
+  "name": "TrackPurchase",
+  "fields": [
+    {"name": "id", "type": "long"},
+    {"name": "song_title", "type": "string"},
+    {"name": "album_id", "type": "long"},
+    {"name": "price", "type": "double"}
+  ]
+}
