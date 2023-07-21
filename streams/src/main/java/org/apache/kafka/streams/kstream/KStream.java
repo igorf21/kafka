@@ -5176,7 +5176,22 @@ public interface KStream<K, V> {
         final String... stateStoreNames
     );
 
-    <VR, KO, VO> KStream<K, VR> leftJoin(final KTable<KO, VO> other,
+    /**
+     * Join records of this {@code KStream} with {@code KTable} using non-windowed left join.
+     * <p>
+     * This is a foreign key join, where the joining key is determined by the {@code foreignKeyExtractor}.
+     *
+     * @param rightTable          the {@code KTable} on the right side of join to be joined with this
+     *                            {@code KStream}. Keyed by KO.
+     * @param foreignKeyExtractor a {@link Function} that extracts the key (KO) from this table's value (V). If the
+     *                            result is null, the update is ignored as invalid.
+     * @param joiner              a {@link ValueJoiner} that computes the join result for a pair of matching records
+     * @param <VR>                the value type of the result {@code KTable}
+     * @param <KO>                the key type of the right {@code KTable}
+     * @param <VO>                the value type of the right {@code KTable}
+     * @return a {@code KStream} that contains the result of joining this stream with {@code rightTable}
+     */
+    <VR, KO, VO> KStream<K, VR> leftJoin(final KTable<KO, VO> rightTable,
                                          final Function<VO, KO> foreignKeyExtractor,
                                          final ValueJoiner<V, VO, VR> joiner);
 }
