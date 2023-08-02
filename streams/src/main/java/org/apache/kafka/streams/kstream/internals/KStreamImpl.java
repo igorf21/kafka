@@ -1600,9 +1600,7 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
                 rightTable,
                 foreignKeyExtractor,
                 joiner,
-                TableJoined.with(null, null),
-                Materialized.with(null, null),
-                false
+                TableJoined.with(null, null)
         );
     }
 
@@ -1620,15 +1618,16 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
     private <VR, KO, VO> KStream<K, VR> doJoinOnForeignKey(final KTable<KO, VO> rightTable,
                                                            final Function<VO, KO> foreignKeyExtractor,
                                                            final ValueJoiner<V, VO, VR> joiner,
-                                                           final TableJoined<K, KO> tableJoined,
-                                                           final Materialized<K, VR, KeyValueStore<Bytes, byte[]>> materialized,
-                                                           final boolean leftJoin) {
+                                                           final TableJoined<K, KO> tableJoined
+                                                           //final Materialized<K, VR, KeyValueStore<Bytes, byte[]>> materialized,
+                                                           //final boolean leftJoin
+                                                           ) {
 
         Objects.requireNonNull(rightTable, "rightTable can't be null");
         Objects.requireNonNull(foreignKeyExtractor, "foreignKeyExtractor can't be null");
         Objects.requireNonNull(joiner, "joiner can't be null");
-        Objects.requireNonNull(tableJoined, "tableJoined can't be null");
-        Objects.requireNonNull(materialized, "materialized can't be null");
+        //Objects.requireNonNull(tableJoined, "tableJoined can't be null");
+        //Objects.requireNonNull(materialized, "materialized can't be null");
 
         //Old values are a useful optimization. The old values from the rightTable table are compared to the new values,
         //such that identical values do not cause a prefixScan. PrefixScan and propagation can be expensive and should
@@ -1641,14 +1640,16 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
 
         final TableJoinedInternal<K, KO> tableJoinedInternal = new TableJoinedInternal<>(tableJoined);
 
-        final NamedInternal renamed = new NamedInternal(tableJoinedInternal.name());
+        //final NamedInternal renamed = new NamedInternal(tableJoinedInternal.name());
 
-        final String subscriptionTopicName = renamed.suffixWithOrElseGet(
+        final String subscriptionTopicName = "right-table-repartition";
+ /*
+                renamed.suffixWithOrElseGet(
                 "-subscription-registration",
                 ((KTableImpl<KO, VO, ?>) rightTable).builder,
                 SUBSCRIPTION_REGISTRATION
         ) + TOPIC_SUFFIX;
-
+*/
         // the decoration can't be performed until we have the configuration available when the app runs,
         // so we pass Suppliers into the components, which they can call at run time
 
@@ -1676,7 +1677,7 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
         final SubscriptionResponseWrapperSerde<VO> responseWrapperSerde =
                 new SubscriptionResponseWrapperSerde<>(((KTableImpl<KO, VO, VO>) rightTable).valueSerde);
 
-        //*********************  Co-partition right table changes with foreign key **************************
+        //*********************  Re-key right table changes with foreign key **************************
         final ProcessorGraphNode<K, Change<VO>> subscriptionNode = new ProcessorGraphNode<>(
                 new ProcessorParameters<>(
                         new NewForeignJoinSubscriptionSendProcessorSupplier<>
@@ -1685,8 +1686,7 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
                                         subscriptionForeignKeySerdePseudoTopic,
                                         valueHashSerdePseudoTopic,
                                         rightTableKeySerde,
-                                        rightTableValueSerde.serializer(),
-                                        leftJoin
+                                        rightTableValueSerde.serializer()
                                 ),
                         "REKEY-MSG-BY-FOREIGN-KEY-PROCESSOR"
                 )
@@ -1694,7 +1694,7 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
 
         builder.addGraphNode(((KTableImpl<KO, VO, ?>) rightTable).graphNode, subscriptionNode);
 
-        //******************** Sink re-partitioned table stream to the intermediate topic *******************
+        //******************** Re-partition & Sink re-keyed table stream to the intermediate topic *******************
 
         final StreamPartitioner<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSinkPartitioner =
                 tableJoinedInternal.otherPartitioner() == null
@@ -1703,7 +1703,7 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
                         partitions(topic, key, null, numPartitions));
 
         final StreamSinkNode<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSink = new StreamSinkNode<>(
-                renamed.suffixWithOrElseGet("-subscription-registration-sink", ((KTableImpl<KO, VO, ?>) rightTable).builder, "KTABLE-SINK-"),
+                "KTABLE-SINK-NODE",
                 new StaticTopicNameExtractor<>(subscriptionTopicName),
                 new ProducedInternal<>(Produced.with(rightTableKeySerde,
                         newSubscriptionWrapperSerde,
@@ -1713,12 +1713,18 @@ public class KStreamImpl<K, V> extends AbstractStream<K, V> implements KStream<K
 
         //********************* Subscribe to child table topic re-partitioned by foreign key ****************
         final StreamSourceNode<KO, NewSubscriptionWrapper<KO, VO>> subscriptionSource = new StreamSourceNode<>(
-                renamed.suffixWithOrElseGet("-subscription-registration-source",
-                        ((KTableImpl<KO, VO, ?>) rightTable).builder, "KTABLE-SOURCE-"),
+                "KTABLE-SOURCE-NODE",
                 Collections.singleton(subscriptionTopicName),
                 new ConsumedInternal<>(Consumed.with(rightTableKeySerde, newSubscriptionWrapperSerde))
         );
         builder.addGraphNode(graphNode, subscriptionSource);
+
+        // The subscription source is the source node on the *different* topology end *after* the repartition.
+        // This topic needs to be copartitioned with the Foreign Key table.
+        final Set<String> copartitionedRepartitionSources =
+                new HashSet<>(((KStreamImpl< ?, ?>) this).subTopologySourceNodes);
+        copartitionedRepartitionSources.add(subscriptionSource.nodeName());
+        builder.internalTopologyBuilder.copartitionSources(copartitionedRepartitionSources);
 
         //************************* Create Composite Key Store and Store table records in the store **********
         final StoreBuilder<TimestampedKeyValueStore<Bytes, NewSubscriptionWrapper<KO, VO>>> subscriptionStore =
